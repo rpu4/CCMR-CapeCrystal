@@ -151,11 +151,7 @@
                       quantities = ['time','potential_energy','temperature'], overwrite = True)
 
     #run simulation
-    job.document['started'] = True
+
     hoomd.run(nsteps)
-    job.document['ended'] = True
 
-    meta = hoomd.meta.dump_metadata(filename=job.fn('meta.txt'))
 
-if __name__ == '__main__':
-    FlowProject().main()
