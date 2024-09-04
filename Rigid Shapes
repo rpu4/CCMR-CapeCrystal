@@ -1,0 +1,161 @@
+
+#For creating rigid shapes
+
+    import hoomd
+    import hoomd.md
+    import numpy as np
+
+    
+    #initial parameters:
+    nsteps = 1e7 #number of steps in simulation
+    dt = .005
+    min_kT = 15 #ending kT of simulation
+    max_kT = 30 #starting kT of simulation
+    N = 40 #simulation box unit cells
+    lattice_constant = 3 #length of unit cell sides
+    nBeads = 32 #number of beads per side of shape
+    mass = 10 #mass of each shape
+    sig = job.sp.sig #sigma for LJ potential of bead
+    eps = job.sp.eps #epsilon for LJ potential of bead
+    r_cut = 2.5*sig #cutoff point for LJ potential of bead
+    stoichiometry = job.sp.stoichiometry #triangle-square stoichiometry
+
+    iVectorSq = np.asarray([4/3,4/3,8/3]) #inertia vector for squares
+    iVectorTr = np.asarray([np.sqrt(3)/6, np.sqrt(3)/6, np.sqrt(3)/3]) #inertia vector for triangles
+
+    edgebiases = job.sp.edgebiases
+    tr_biases = edgebiases[0]
+    sq_biases = edgebiases[1]
+    tr_len = len(tr_biases)
+    sq_len = len(sq_biases)
+
+    #setup simulation
+    hoomd.context.initialize("--mode=gpu")
+    uc = hoomd.lattice.unitcell(N = 1,
+                                a1 = [lattice_constant, 0, 0],
+                                a2 = [0, lattice_constant, 0],
+                                a3 = [0, 0, 1],
+                                dimensions = 2,
+                                position = [[0, 0, 0]],
+                                mass = [mass],
+                                type_name = ["COM_SQ_0"],
+                                moment_inertia = [mass*iVectorSq],
+                                orientation = [[1, 0, 0, 0]])
+    system = hoomd.init.create_lattice(uc, N)
+
+    sq_COM = ["COM_SQ_"+ str(n+1) for n in range(sq_len-1)]
+    tr_COM = ["COM_TR_"+ str(n) for n in range(tr_len)]
+
+    for COM in sq_COM:
+        system.particles.types.add(COM)
+    for COM in tr_COM:
+        system.particles.types.add(COM)
+
+#Add specific particle types:
+    system.particles.types.add("Example")
+
+
+    #replace squares with triangles
+    snapshot = system.take_snapshot()
+    COM_tags = np.random.choice(tr_len+sq_len, N*N,
+                                p = sq_len*[(1-stoichiometry)/sq_len]+tr_len*[stoichiometry/tr_len])
+    for n in range(len(COM_tags)):
+        snapshot.particles.typeid[n] = COM_tags[n]
+        if COM_tags[n] > sq_len: snapshot.particles.moment_inertia[n] = mass*iVectorTr
+    system.restore_snapshot(snapshot)
+
+    #square rigid body geometry
+    x_pos_sq = np.linspace(-0.5,.5,nBeads)
+    y_pos_sq = np.linspace(-0.5,.5,nBeads)
+    sq_pos_left = []
+    sq_pos_right = []
+    sq_pos_top = []
+    sq_pos_bottom = []
+    for i in x_pos_sq:
+        sq_pos_bottom.append([i, y_pos_sq[0], 0])
+        sq_pos_top.append([i, y_pos_sq[-1], 0])
+    for j in y_pos_sq[1:-1]:
+        sq_pos_left.append([x_pos_sq[0], j, 0])
+        sq_pos_right.append([x_pos_sq[-1], j, 0])
+
+    #triangle rigid body geometry
+    x_bottom_pos_tr = np.linspace(-0.5,0.5,nBeads)
+    x_side_pos_tr = np.linspace(-0.5,0,nBeads)
+    y_pos_tr = np.linspace(-np.sqrt(3)/6,np.sqrt(3)/3,nBeads)
+    tr_pos_left = []
+    tr_pos_right = []
+    tr_pos_bottom = []
+    for i in x_bottom_pos_tr[1:-1]:
+        tr_pos_bottom.append([i, y_pos_tr[0],0])
+    for i in range(0,len(y_pos_tr)):
+        tr_pos_left.append([x_side_pos_tr[i], y_pos_tr[i],0])
+        tr_pos_right.append([-x_side_pos_tr[i], y_pos_tr[i],0])
+    tr_pos_right = tr_pos_right[:-1]
+
+    #set up rigid bodies
+    rigid = hoomd.md.constrain.rigid();
+
+    for n in range(tr_len):
+        rigid.set_param(tr_COM[n],
+                        types = ["Edge_T-"+tr_biases[n][0]]*len(tr_pos_right) +
+                        ["Edge_T-"+tr_biases[n][1]]*len(tr_pos_bottom) +
+                        ["Edge_T-"+tr_biases[n][2]]*len(tr_pos_left),
+                        positions = tr_pos_right + tr_pos_bottom + tr_pos_left)
+
+    sq_COM = ["COM_SQ_0"]+sq_COM
+    for n in range(sq_len):
+        rigid.set_param(sq_COM[n],
+                        types = ["Edge_S-"+sq_biases[n][0]]*len(sq_pos_top) +
+                        ["Edge_S-"+sq_biases[n][1]]*len(sq_pos_right) +
+                        ["Edge_S-"+sq_biases[n][2]]*len(sq_pos_bottom) +
+                        ["Edge_S-"+sq_biases[n][3]]*len(sq_pos_left),
+                        positions = sq_pos_top + sq_pos_right + sq_pos_bottom + sq_pos_left)
+
+    rigid.create_bodies()
+    nl = hoomd.md.nlist.cell()
+
+    #set up LJ potentials
+    ljAttract = hoomd.md.pair.lj(r_cut = r_cut, nlist=nl)
+
+    ljAttract.pair_coeff.set(tr_COM + sq_COM,
+                              tr_COM + sq_COM + ["Edge_S-S", "Edge_T-T", "Edge_S-T", "Edge_T-S"],
+                              epsilon = 0, sigma = sig, r_cut = r_cut)
+
+    #set up WCA potentials
+    ljRepel = hoomd.md.pair.lj(r_cut = r_cut, nlist=nl)
+    ljRepel.pair_coeff.set(["Edge_S-S"],["Edge_S-S"], epsilon = 0, sigma = sig, r_cut = 2**(1/6)*sig)
+    ljRepel.pair_coeff.set(["Edge_T-T"],["Edge_T-T"], epsilon = 0, sigma = sig, r_cut = 2**(1/6)*sig)
+    ljRepel.pair_coeff.set(["Edge_S-T"],["Edge_T-S"], epsilon = 0, sigma = sig, r_cut = 2**(1/6)*sig)
+    ljRepel.pair_coeff.set(["Edge_S-S"],
+                            ["Edge_T-T", "Edge_S-T", "Edge_T-S"],
+                            epsilon = eps, sigma = sig, r_cut = 2**(1/6)*sig)
+    ljRepel.pair_coeff.set(["Edge_T-T"],["Edge_S-T", "Edge_T-S"], epsilon = eps, sigma = sig, r_cut = 2**(1/6)*sig)
+    ljRepel.pair_coeff.set(["Edge_S-T"],["Edge_S-T"], epsilon = eps, sigma = sig, r_cut = 2**(1/6)*sig)
+    ljRepel.pair_coeff.set(["Edge_T-S"],["Edge_T-S"], epsilon = eps, sigma = sig, r_cut = 2**(1/6)*sig)
+    ljRepel.pair_coeff.set(tr_COM + sq_COM,
+                            tr_COM + sq_COM + ["Edge_S-S", "Edge_T-T", "Edge_S-T", "Edge_T-S"],
+                            epsilon = 0, sigma = sig, r_cut = 2**(1/6)*sig)
+
+    #generate simulation seed
+    seed = np.random.randint(1,1e6)
+    job.document['seed'] = seed
+
+    #set up integration
+    hoomd.md.integrate.mode_standard(dt=dt)
+    cooling = hoomd.variant.linear_interp([[0,max_kT],[nsteps,min_kT]])
+    hoomd.md.integrate.langevin(group=hoomd.group.rigid_center(), kT=cooling, seed=seed);
+
+    #log data
+    hoomd.dump.gsd(job.fn("traj.gsd"),period=nsteps/100,group=hoomd.group.all(),overwrite = True)
+    hoomd.analyze.log(filename = job.fn("traj.log"), period = nsteps/1000,
+                      quantities = ['time','potential_energy','temperature'], overwrite = True)
+
+    #run simulation
+    job.document['started'] = True
+    hoomd.run(nsteps)
+    job.document['ended'] = True
+
+    meta = hoomd.meta.dump_metadata(filename=job.fn('meta.txt'))
+
+if __name__ == '__main__':
+    FlowProject().main()
